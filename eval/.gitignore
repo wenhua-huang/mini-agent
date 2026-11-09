@@ -1,0 +1,4 @@
+# 评测临时副本与计费结果不入库
+.eval_work/
+results/
+__pycache__/

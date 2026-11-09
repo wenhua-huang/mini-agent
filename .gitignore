@@ -1,0 +1,22 @@
+# 虚拟环境（30M，不入库）
+.venv/
+
+# 密钥与本地配置（loop/.env、mcp/.env 含百炼 API Key）
+.env
+*.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# SQLite 运行时库与 WAL 临时文件（runtime.py 产生）
+*.db
+*.db-wal
+*.db-shm
+
+# 评测临时副本与计费结果
+.eval_work/
+results/
+
+# macOS
+.DS_Store
