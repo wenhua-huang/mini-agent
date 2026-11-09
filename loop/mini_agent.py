@@ -27,6 +27,9 @@ from compaction import (
 from worker_types import WORKER_TYPES, render_worker_catalog
 from plan_mode import PlanModeState
 from tracer import NullRecorder
+from checkpoint import (
+    CheckpointStore, CancellationRequested, CANCELLED, SUCCEEDED, FAILED,
+)
 
 # 从 loop/.env 读取 key（已加入 .gitignore，不提交）
 load_dotenv(Path(__file__).parent / ".env")
@@ -524,7 +527,18 @@ def _chat_create(messages, tool_schemas=None):
 def run_agent(task: str, cwd: str = ".", approver=interactive_approver,
               summarizer=_llm_summarizer, compact_strategy: str = "summarize",
               worker_chat_fn=None, plan_state=None, recorder=None,
-              trace_path: str = "") -> str:
+              trace_path: str = "",
+              checkpoint_db: str = "", resume_task_id: str = "") -> str:
+    """
+    checkpoint_db/resume_task_id 都为空时行为与旧版完全一致（默认不启用持久化）。
+    给 checkpoint_db：新建可恢复任务；同时给 resume_task_id：从事件流恢复续跑。
+    """
+    # ── 可恢复运行时（可选，默认关闭）：任务实体化 + 事件流 + 租约/幂等 ──
+    ckpt = None
+    if checkpoint_db:
+        ckpt = CheckpointStore(checkpoint_db, task, resume_task_id=resume_task_id)
+        print(f"[checkpoint] task_id={ckpt.task_id} fencing=v{ckpt.fencing}"
+              f" 模式={'恢复' if resume_task_id else '新建'}")
     # ── Plan Mode（第八课）：主会话状态机；可注入便于离线测试 ──
     if plan_state is None:
         plan_state = PlanModeState(base_dir=cwd)
@@ -548,10 +562,15 @@ def run_agent(task: str, cwd: str = ".", approver=interactive_approver,
         "不要只在回复文本里贴代码；工具报错（含参数 JSON 错误）时请按提示修正参数后重试，不要放弃工具改用口述。\n\n"
         + build_context_block(cwd)
     )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task},
-    ]
+    if ckpt is not None and resume_task_id:
+        # 恢复模式：system 在前，历史从 SQLite 事件流重建（孤儿 tool_call 已在适配层截掉）
+        messages = [{"role": "system", "content": system_prompt}] + ckpt.restore_messages()
+        print(f"[checkpoint] 从事件流重建 {len(messages)} 条消息，跳过已完成步骤的副作用")
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task},
+        ]
     total_tokens = 0
 
     # 工具分发表：把本次会话的目标目录绑定进每个工具（模型只传业务参数，不知道 cwd）
@@ -583,6 +602,14 @@ def run_agent(task: str, cwd: str = ".", approver=interactive_approver,
 
     # ── 4. 工具调用循环本体 ────────────────────────────
     for turn in range(1, MAX_TURNS + 1):
+        # 可恢复模式：每轮先过安全点（取消标志 / fencing 失配 / 心跳续租）
+        if ckpt is not None:
+            try:
+                ckpt.safe_point()
+            except CancellationRequested as e:
+                print(f"[checkpoint] 安全点停止：{e}")
+                ckpt.finish(CANCELLED)
+                return f"（任务已取消：{e}）"
         # 压缩闸门：账本到阈值（约窗口80%）先压缩，别等 API 400
         if estimate_tokens(messages) > COMPACT_THRESHOLD:
             before = len(messages)
@@ -614,11 +641,17 @@ def run_agent(task: str, cwd: str = ".", approver=interactive_approver,
         except APIError as e:
             kind = classify_error(e)
             if kind == "auth":
+                if ckpt is not None:
+                    ckpt.finish(FAILED, error="auth 401/403")
                 return "（认证失败 401/403：请检查 .env 里的 API key，重试无意义，已停止）"
             if kind == "bad_request":
+                if ckpt is not None:
+                    ckpt.finish(FAILED, error="bad_request 400")
                 return f"（请求被拒绝 400（可能上下文过长）：{e}）"
             raise
         except RuntimeError as e:
+            if ckpt is not None:
+                ckpt.finish(FAILED, error=str(e))
             return f"（{e}）"  # 连续过载 → 真实系统这里会换备用模型
 
         # 闸门②：token 预算（流式时也是逐条 usage 累加，这里非流式同理）
@@ -633,6 +666,8 @@ def run_agent(task: str, cwd: str = ".", approver=interactive_approver,
             print(f"[闸门] 超过 token 预算 {MAX_TOTAL_TOKENS}，强制停止")
             recorder.event("budget_exceeded", turn=turn,
                            total_tokens=total_tokens, limit=MAX_TOTAL_TOKENS)
+            if ckpt is not None:
+                ckpt.finish(FAILED, error="token budget exceeded")
             return "（已达 token 预算上限，任务中止）"
 
         msg = resp.choices[0].message
@@ -641,12 +676,19 @@ def run_agent(task: str, cwd: str = ".", approver=interactive_approver,
         if not msg.tool_calls:
             print("[循环] 模型返回纯文本 → 结束")
             print(f"\n最终答案：\n{msg.content}")
+            if ckpt is not None:
+                ckpt.log_assistant({"role": "assistant", "content": msg.content})
+                ckpt.finish(SUCCEEDED)
             return msg.content
 
         # 情况 B：模型请求调工具。先把它的「请求」原样记入账本
-        messages.append(msg.model_dump(exclude_none=True))
+        assistant_msg = msg.model_dump(exclude_none=True)
+        messages.append(assistant_msg)
+        if ckpt is not None:
+            ckpt.log_assistant(assistant_msg)  # 崩溃后世界知道这步「打算调什么」
 
         # 逐个执行工具（真实 Claude Code 里只读工具在这里并行）
+        last_idem_key, last_replayed = "", False
         for tc in msg.tool_calls:
             name = tc.function.name
             with recorder.span("tool_call", tool=name, turn=turn,
@@ -689,8 +731,25 @@ def run_agent(task: str, cwd: str = ".", approver=interactive_approver,
                             sp.set("status", "no_tool")
                         else:
                             try:
-                                result = fn(**args)
+                                if ckpt is not None:
+                                    # 幂等键由事件流已完成的 tool 事件数派生（不依赖内存账本），
+                                    # 崩溃重放/孤儿截掉后仍算出同一个键，命中缓存则工具不重复执行
+                                    idem_key = ckpt.next_idem_key(name)
+                                    result, replayed = ckpt.run_tool_idempotent(
+                                        idem_key, lambda: fn(**args))
+                                    last_idem_key, last_replayed = idem_key, replayed
+                                    if replayed:
+                                        print(f"[checkpoint] 命中幂等缓存 {idem_key}，工具未重复执行")
+                                        sp.set("replayed", True)
+                                else:
+                                    result = fn(**args)
                                 sp.set("status", "ok")
+                            except CancellationRequested as e:
+                                # 长工具调用期间执行权被接管：收口为 CANCELLED 并退出，
+                                # 工具副作用若已发生，由幂等键在下次重放时向外部系统去重
+                                print(f"[checkpoint] 工具期间停止：{e}")
+                                ckpt.finish(CANCELLED, error=str(e))
+                                return f"（任务已取消：{e}）"
                             except Exception as e:
                                 # 工具报错不能炸掉整个循环：把异常当结果回灌，模型可以据此改主意
                                 result = f"工具执行出错：{type(e).__name__}: {e}"
@@ -701,16 +760,24 @@ def run_agent(task: str, cwd: str = ".", approver=interactive_approver,
                 # 结果回灌：OpenAI 协议 role=tool，必须带 tool_call_id 对上号
                 # 安全：工具返回一律按「不可信数据」包裹（可能含提示词注入），
                 # 但硬防线不在这里——危险动作在上面的 check_permission 已被拦截。
-                messages.append({
+                tool_message = {
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": wrap_untrusted(name, str(result)),
-                })
+                }
+                messages.append(tool_message)
+                if ckpt is not None:
+                    # 非真实执行分支（拒绝/坏参数/未知工具）key 为空、replayed=False，事件仍完整落盘
+                    ckpt.log_tool_result(tc.id, tool_message,
+                                         last_idem_key, replayed=last_replayed)
+                    last_idem_key, last_replayed = "", False
         # for 结束 → 回到循环顶部，带着工具结果再次请求模型
 
     # 闸门①：max_turns 到顶
     print(f"\n[闸门] 已达最大轮次 {MAX_TURNS}，强制停止")
     recorder.event("max_turns_reached", turn=MAX_TURNS, limit=MAX_TURNS)
+    if ckpt is not None:
+        ckpt.finish(FAILED, error="max_turns exceeded")
     return "（已达最大轮次，任务中止）"
 
 
