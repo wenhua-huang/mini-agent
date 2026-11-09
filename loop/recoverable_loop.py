@@ -20,6 +20,7 @@ recoverable_loop.py — 可恢复 Agent 循环（第 2 步：把 runtime 原语�
 tool_result 配对。重建内存 messages 时，末尾未配对的 tool_call 事件直接截掉，
 让 planner 重新决策（替代方案：补一条 interrupted 的 tool 消息，见 rebuild 注释）。
 """
+import json
 import os
 import sys
 
@@ -111,14 +112,25 @@ def run_recoverable(conn, task_id, worker_id, fencing_version,
             return "succeeded"
 
         # ── 工具调用分支 ──
+        # call_id 用事件落盘后的 seq 派生（seq 任务内单调唯一）：
+        # 不能用 len(messages)——崩溃重放后消息数与首次相同，会复用旧 id，
+        # 导致孤儿 tool_call 被误判为已配对
         tool_name, args = decision["name"], decision["args"]
-        call_id = f"call_{len(messages)}_{tool_name}"
         idem_key = _next_idem_key(events, tool_name)
 
         # 4a-1 先落 tool_call 事件（崩溃后世界知道这步「打算做什么」）
-        rt.append_event(conn, task_id, "tool_call",
-                        {"kind": "tool_call", "call_id": call_id,
-                         "name": tool_name, "args": args})
+        seq = rt.append_event(conn, task_id, "tool_call",
+                              {"kind": "tool_call", "name": tool_name, "args": args})
+        call_id = f"call_seq{seq}"
+        # 回填 call_id 到刚落盘的事件 payload，保证与 tool_result 的配对 id 一致
+        with conn:
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE task_id=? AND seq=?",
+                (json.dumps(
+                    {"kind": "tool_call", "call_id": call_id,
+                     "name": tool_name, "args": args}, ensure_ascii=False),
+                 task_id, seq),
+            )
 
         if crash_points.get(idem_key) == BEFORE_TOOL:
             crash_points.pop(idem_key)  # 只崩一次：重放时该夹缝不再触发
