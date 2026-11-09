@@ -58,10 +58,18 @@ def cmd_submit(conn, args):
 
 
 def cmd_run(conn, args):
-    task_id, version = rt.claim_task(conn, args.worker, lease_seconds=30)
-    if task_id is None:
-        print("NO_TASK", flush=True)
-        sys.exit(2)
+    if args.task_id:
+        # 显式模式：reaper 已接管并持有租约，同进程直接续跑，不再 claim
+        row = rt.get_task(conn, args.task_id)
+        if row is None or row["lease_owner"] != args.worker:
+            print(f"NOT_OWNED task={args.task_id}", flush=True)
+            sys.exit(3)
+        task_id, version = args.task_id, row["version"]
+    else:
+        task_id, version = rt.claim_task(conn, args.worker, lease_seconds=30)
+        if task_id is None:
+            print("NO_TASK", flush=True)
+            sys.exit(2)
     print(f"claimed task={task_id} fencing_version={version} pid={os.getpid()}", flush=True)
 
     crash_points = {}
@@ -93,6 +101,16 @@ def cmd_expire(conn, args):
     print("lease expired", flush=True)
 
 
+def cmd_reap(conn, args):
+    """reaper 单次扫描：打印接管到的 (task_id, version)，没有则 NONE。"""
+    taken = rt.reap_once(conn, args.worker, lease_seconds=30)
+    if not taken:
+        print("NONE", flush=True)
+        return
+    for task_id, version in taken:
+        print(f"reaped task={task_id} fencing_version={version}", flush=True)
+
+
 def cmd_status(conn, args):
     row = rt.get_task(conn, args.task_id)
     print(json.dumps({k: row[k] for k in
@@ -115,11 +133,16 @@ def main():
     p = sub.add_parser("run")
     p.add_argument("--worker", required=True)
     p.add_argument("--crash", default="")
+    p.add_argument("--task-id", default="", help="显式续跑指定任务（reaper 接管后用），省略则自动 claim")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("expire")
     p.add_argument("--task-id", required=True)
     p.set_defaults(func=cmd_expire)
+
+    p = sub.add_parser("reap")
+    p.add_argument("--worker", required=True)
+    p.set_defaults(func=cmd_reap)
 
     p = sub.add_parser("status")
     p.add_argument("--task-id", required=True)

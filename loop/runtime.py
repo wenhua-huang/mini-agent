@@ -107,12 +107,14 @@ def claim_task(conn: sqlite3.Connection, worker_id: str, lease_seconds: float = 
     """
     now = time.time()
     with conn:
+        # CANCELLING 也必须可接管：worker 收到取消后崩溃的场景，
+        # 接管者在 loop 安全点 1b 读到 cancel_requested=1，负责收口为 CANCELLED
         row = conn.execute(
             "SELECT task_id, version FROM tasks "
-            "WHERE status IN (?, ?) "
+            "WHERE status IN (?, ?, ?) "
             "AND (lease_expire_at IS NULL OR lease_expire_at < ?) "
             "ORDER BY created_at LIMIT 1",
-            (PENDING, RUNNING, now),
+            (PENDING, RUNNING, CANCELLING, now),
         ).fetchone()
         if row is None:
             return None, None
@@ -219,12 +221,84 @@ def get_task(conn: sqlite3.Connection, task_id: str):
     return conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
 
 
-def run_idempotent(conn: sqlite3.Connection, task_id: str, idem_key: str, fn):
+def append_event_guarded(conn: sqlite3.Connection, task_id: str, event_type: str,
+                         payload: dict, worker_id: str, fencing_version: int) -> int:
+    """
+    带 fencing 校验的事件写入（窄窗口防线）。
+
+    场景：worker 通过安全点后经历长 LLM/工具调用，期间租约过期被 reaper 接管，
+    旧 worker 复活后若能继续写事件，会污染新 owner 的事件流。
+    这里在写入瞬间复核 owner+version，失配直接抛异常，调用方按 lost_lease 收口。
+    """
+    row = conn.execute(
+        "SELECT lease_owner, version FROM tasks WHERE task_id=?", (task_id,),
+    ).fetchone()
+    if row is None or row["lease_owner"] != worker_id or row["version"] != fencing_version:
+        raise RuntimeError(
+            f"fencing guard rejected write: task={task_id} "
+            f"writer={worker_id}/v{fencing_version} "
+            f"current={row['lease_owner'] if row else None}/v{row['version'] if row else '?'}"
+        )
+    return append_event(conn, task_id, event_type, payload)
+
+
+def find_zombie_tasks(conn: sqlite3.Connection, now: float = None):
+    """
+    reaper 扫描器：找出「声称在跑但心跳已死」的僵尸任务。
+    只负责发现 + 写审计事件，不直接改状态——接管统一走 claim_task，
+    保证状态变更只有一条写路径，避免 reaper 与 worker 竞争同一行。
+
+    僵尸定义：RUNNING/CANCELLING（非 PENDING，PENDING 只是排队不是僵尸）
+    且 lease_expire_at 已过期。终态任务天然排除。
+    返回 task_id 列表（按创建时间，先僵先收）。
+    """
+    if now is None:
+        now = time.time()
+    rows = conn.execute(
+        "SELECT task_id FROM tasks "
+        "WHERE status IN (?, ?) AND lease_expire_at IS NOT NULL AND lease_expire_at < ? "
+        "ORDER BY created_at",
+        (RUNNING, CANCELLING, now),
+    ).fetchall()
+    zombie_ids = [r["task_id"] for r in rows]
+    for tid in zombie_ids:
+        append_event(conn, tid, "system_note",
+                     {"kind": "zombie_detected", "at": now,
+                      "reason": "lease expired without heartbeat"})
+    return zombie_ids
+
+
+def reap_once(conn: sqlite3.Connection, worker_id: str, lease_seconds: float = 30.0):
+    """
+    reaper 守护循环的单次迭代：发现僵尸 → 逐个尝试接管。
+
+    多 reaper 实例并发时靠 claim_task 的乐观锁兜底：
+    僵尸可能已被别的 reaper 抢走（version 变了），claim 到 None 就跳过，不报错。
+    返回成功接管的 [(task_id, new_version)]，守护进程拿到后逐个喂给 agent loop。
+    """
+    zombies = find_zombie_tasks(conn)
+    taken = []
+    for _ in zombies:
+        task_id, version = claim_task(conn, worker_id, lease_seconds)
+        if task_id is None:
+            break  # 被别的 reaper 抢完或没有可领任务
+        taken.append((task_id, version))
+    return taken
+
+
+def run_idempotent(conn: sqlite3.Connection, task_id: str, idem_key: str, fn,
+                   worker_id: str = None, fencing_version: int = None):
     """
     工具调用的幂等闸门：
       首次：执行 fn() 拿真实结果，落 tool_invocations（DONE + 结果）
       重放：不执行 fn，直接返回缓存结果 → 短信/付款等副作用绝不重复
     返回 (result, replayed)；fn 抛异常时记 FAILED 并照常抛出（允许重试）。
+
+    窄窗口防护（可选，传入 worker_id 即启用）：
+      fn 可能是长调用，返回后先复核 owner/version，失配则结果不落库、抛 RuntimeError，
+      防止旧 worker 把接管期间产生的结果写进新 owner 的幂等表。
+      注意：若外部副作用实际已发生，新 owner 重放时仍靠同一 idem_key 向外部系统去重——
+      本地表没占坑不代表副作用没发生，这正是幂等键必须同步给外部系统的原因。
     """
     cached = conn.execute(
         "SELECT status, result FROM tool_invocations WHERE task_id=? AND idem_key=?",
@@ -232,9 +306,23 @@ def run_idempotent(conn: sqlite3.Connection, task_id: str, idem_key: str, fn):
     ).fetchone()
     if cached is not None and cached["status"] == "DONE":
         return json.loads(cached["result"]), True
+
+    def guard():
+        if worker_id is not None:
+            row = conn.execute(
+                "SELECT lease_owner, version FROM tasks WHERE task_id=?", (task_id,),
+            ).fetchone()
+            if (row is None or row["lease_owner"] != worker_id
+                    or row["version"] != fencing_version):
+                raise RuntimeError(
+                    f"fencing guard rejected idempotent write: task={task_id} "
+                    f"writer={worker_id}/v{fencing_version}")
+
     try:
         result = fn()
+        guard()  # 长调用返回后验明正身
     except Exception as exc:
+        guard()  # 失败路径同样校验；fencing 失配优先报失配
         with conn:
             conn.execute(
                 "INSERT OR REPLACE INTO tool_invocations(task_id, idem_key, status, result) "

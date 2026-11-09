@@ -36,6 +36,10 @@ class SimulatedCrash(Exception):
     """测试用：模拟进程在指定夹缝死亡（内存状态全丢，磁盘事件保留）。"""
 
 
+class FencingError(Exception):
+    """窄窗口防线：写入者已不是当前 owner（租约在长调用期间被接管），写入被拒。"""
+
+
 def rebuild_messages(events):
     """
     回放事件流重建内存 messages。
@@ -84,6 +88,11 @@ def run_recoverable(conn, task_id, worker_id, fencing_version,
     """
     crash_points = crash_points or {}
 
+    def guarded(event_type, payload):
+        """统一走 fencing 校验的事件写入；失配时翻译成 lost_lease 语义。"""
+        return rt.append_event_guarded(
+            conn, task_id, event_type, payload, worker_id, fencing_version)
+
     while True:
         # ── 安全点 1a：验明正身。fencing 失配=租约已被新 worker 接管，
         #    旧 worker 必须静默退出，无权写任何状态（更不能替新 owner 写终态）──
@@ -106,9 +115,12 @@ def run_recoverable(conn, task_id, worker_id, fencing_version,
         decision = planner(messages)
 
         if decision["type"] == "final":
-            rt.append_event(conn, task_id, "assistant",
-                            {"kind": "final", "content": decision["content"]})
-            rt.finish_task(conn, task_id, worker_id, fencing_version, rt.SUCCEEDED)
+            try:
+                guarded("assistant", {"kind": "final", "content": decision["content"]})
+            except RuntimeError:
+                return "lost_lease"  # 长 LLM 调用期间被接管
+            if not rt.finish_task(conn, task_id, worker_id, fencing_version, rt.SUCCEEDED):
+                return "lost_lease"
             return "succeeded"
 
         # ── 工具调用分支 ──
@@ -118,19 +130,21 @@ def run_recoverable(conn, task_id, worker_id, fencing_version,
         tool_name, args = decision["name"], decision["args"]
         idem_key = _next_idem_key(events, tool_name)
 
-        # 4a-1 先落 tool_call 事件（崩溃后世界知道这步「打算做什么」）
-        seq = rt.append_event(conn, task_id, "tool_call",
-                              {"kind": "tool_call", "name": tool_name, "args": args})
-        call_id = f"call_seq{seq}"
-        # 回填 call_id 到刚落盘的事件 payload，保证与 tool_result 的配对 id 一致
-        with conn:
-            conn.execute(
-                "UPDATE task_events SET payload=? WHERE task_id=? AND seq=?",
-                (json.dumps(
-                    {"kind": "tool_call", "call_id": call_id,
-                     "name": tool_name, "args": args}, ensure_ascii=False),
-                 task_id, seq),
-            )
+        try:
+            # 4a-1 先落 tool_call 事件（带 fencing：长决策期间被接管则拒绝写入）
+            seq = guarded("tool_call", {"kind": "tool_call", "name": tool_name, "args": args})
+            call_id = f"call_seq{seq}"
+            # 回填 call_id 到刚落盘的事件 payload，保证与 tool_result 的配对 id 一致
+            with conn:
+                conn.execute(
+                    "UPDATE task_events SET payload=? WHERE task_id=? AND seq=?",
+                    (json.dumps(
+                        {"kind": "tool_call", "call_id": call_id,
+                         "name": tool_name, "args": args}, ensure_ascii=False),
+                     task_id, seq),
+                )
+        except RuntimeError:
+            return "lost_lease"
 
         if crash_points.get(idem_key) == BEFORE_TOOL:
             crash_points.pop(idem_key)  # 只崩一次：重放时该夹缝不再触发
@@ -140,13 +154,21 @@ def run_recoverable(conn, task_id, worker_id, fencing_version,
         def invoke():
             return tools[tool_name](args)
 
-        result, replayed = rt.run_idempotent(conn, task_id, idem_key, invoke)
+        try:
+            result, replayed = rt.run_idempotent(
+                conn, task_id, idem_key, invoke,
+                worker_id=worker_id, fencing_version=fencing_version)
+        except RuntimeError:
+            return "lost_lease"  # 长工具调用期间被接管，副作用结果不写入新 owner 的账本
 
         if crash_points.get(idem_key) == AFTER_TOOL:
             crash_points.pop(idem_key)  # 只崩一次
             raise SimulatedCrash(f"崩溃于 {idem_key} 的 AFTER_TOOL 夹缝")
 
         # 4a-3 再落 tool_result，配对完成
-        rt.append_event(conn, task_id, "tool_result",
-                        {"kind": "tool_result", "call_id": call_id,
-                         "idem_key": idem_key, "replayed": replayed, "output": result})
+        try:
+            guarded("tool_result",
+                    {"kind": "tool_result", "call_id": call_id,
+                     "idem_key": idem_key, "replayed": replayed, "output": result})
+        except RuntimeError:
+            return "lost_lease"
