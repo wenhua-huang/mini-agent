@@ -1,0 +1,6 @@
+# 运行依赖（Python 3.9+，在 .venv 中实测版本见括号）
+openai>=1.0            # OpenAI 兼容协议客户端，对接阿里百炼 qwen-plus（实测 2.48.0）
+python-dotenv>=1.0     # 从 loop/.env / mcp/.env 读取本地配置（实测 1.2.1）
+
+# 其余包（pydantic / httpx / anyio / sniffio 等）由 openai 传递安装，无需手动指定。
+# 注意：loop/.env、mcp/.env 含 API Key，已被 .gitignore 忽略，不会入库。
