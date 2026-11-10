@@ -67,7 +67,7 @@ implemented by hand and backed by an offline test, rather than imported from a f
 
 - **26** `test_*.py` files — **25** self-contained assertion suites plus 1 mock-server fixture
   (`mcp/test_server_oauth.py`, a `serve_forever` harness the OAuth flow test depends on).
-- **366** `expect(...)` assertions (plus 32 bare `assert` statements, 398 total). All 25
+- **347** `expect(...)` assertions (plus 32 bare `assert` statements, 379 total; counted by AST on 2026-11-10). All 25
   suites pass offline; the OAuth flow passes once its fixture server is started.
 - Live model runs use Alibaba Bailian `qwen-plus` over an OpenAI-compatible API and cost real
   tokens, so they are kept separate from the zero-token offline regression suites.
@@ -143,7 +143,7 @@ python loop/mini_agent.py <project_dir> "<task>" [trace.jsonl]
 
 - **26** 个 `test_*.py` 文件：**25** 个自包含断言套件 + 1 个模拟服务器夹具
   （`mcp/test_server_oauth.py`，OAuth 流程测试依赖的 `serve_forever` 服务）。
-- **366** 条 `expect(...)` 断言（另有 32 条裸 `assert`，合计 398）。25 个套件离线全绿；
+- **347** 条 `expect(...)` 断言（另有 32 条裸 `assert`，合计 379；2026-11-10 用 AST 逐文件清点）。25 个套件离线全绿；
   OAuth 流程在夹具服务器启动后通过。
 - 真模型联调用阿里百炼 `qwen-plus`（OpenAI 兼容协议）、真实计费，与零 token 的离线回归
   套件严格分开。
